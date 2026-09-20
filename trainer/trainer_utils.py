@@ -8,7 +8,7 @@ import random
 import time
 
 import torch
-from torch.utils.data import Sampler
+from torch.utils.data import DataLoader, Sampler, Subset
 from torch.nn.utils import clip_grad_norm_
 
 
@@ -30,6 +30,29 @@ class EpochRandomSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return len(self.data_source)
+
+
+def _build_resumed_dataloader(dataloader, skip_batches: int):
+    """直接从未处理的索引构造 DataLoader，避免恢复时重新读取旧 batch。"""
+    if skip_batches <= 0:
+        return dataloader
+    if dataloader.batch_size is None:
+        raise ValueError("恢复训练要求 DataLoader 使用 batch_size，而不是自定义 batch_sampler")
+
+    # sampler 的顺序由 EpochRandomSampler.set_epoch() 决定，先生成索引不会触发 Dataset.__getitem__。
+    indices = list(iter(dataloader.sampler))
+    start_index = skip_batches * dataloader.batch_size
+    remaining_dataset = Subset(dataloader.dataset, indices[start_index:])
+    return DataLoader(
+        remaining_dataset,
+        batch_size=dataloader.batch_size,
+        shuffle=False,
+        num_workers=dataloader.num_workers,
+        collate_fn=dataloader.collate_fn,
+        pin_memory=dataloader.pin_memory,
+        drop_last=dataloader.drop_last,
+        persistent_workers=dataloader.persistent_workers if dataloader.num_workers else False,
+    )
 
 
 def setup_seed(seed: int) -> None:
@@ -173,7 +196,8 @@ def train_model(
         )
         print(f"已恢复 checkpoint：epoch={start_epoch}, step={global_step}, batch={resume_batch}")
 
-    steps_per_epoch = math.ceil(len(dataloader) / accumulation_steps)
+    batches_per_epoch = len(dataloader)
+    steps_per_epoch = math.ceil(batches_per_epoch / accumulation_steps)
     total_steps = max_steps if max_steps > 0 else steps_per_epoch * epochs
     started_at = time.perf_counter()
     tokens_seen = 0
@@ -188,10 +212,13 @@ def train_model(
                 dataloader.sampler.set_epoch(epoch)
             skip_batches = resume_batch if epoch == start_epoch else 0
             resume_batch = 0
+            epoch_dataloader = dataloader
+            if skip_batches:
+                print(f"恢复训练：直接跳过已完成的 {skip_batches} 个 batch。")
+                epoch_dataloader = _build_resumed_dataloader(dataloader, skip_batches)
 
-            for batch_index, batch in enumerate(dataloader, start=1):
-                if batch_index <= skip_batches:
-                    continue
+            for local_batch_index, batch in enumerate(epoch_dataloader, start=1):
+                batch_index = skip_batches + local_batch_index
 
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 labels = batch["labels"].to(device, non_blocking=True)
@@ -204,7 +231,7 @@ def train_model(
                     scaled_loss = loss / accumulation_steps
 
                 scaler.scale(scaled_loss).backward()
-                should_update = batch_index % accumulation_steps == 0 or batch_index == len(dataloader)
+                should_update = batch_index % accumulation_steps == 0 or batch_index == batches_per_epoch
                 if not should_update:
                     continue
 
@@ -220,7 +247,7 @@ def train_model(
                 steps_per_second = global_step / elapsed if elapsed > 0 else 0.0
                 remaining = (total_steps - global_step) / steps_per_second if steps_per_second else float("inf")
                 tokens_per_second = tokens_seen / elapsed if elapsed > 0 else 0.0
-                if global_step % log_interval == 0 or batch_index == len(dataloader):
+                if global_step % log_interval == 0 or batch_index == batches_per_epoch:
                     if writer is not None:
                         writer.add_scalar("train/loss", loss.item(), global_step)
                         writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], global_step)
