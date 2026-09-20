@@ -135,6 +135,15 @@ def _atomic_torch_save(value, path: Path) -> None:
             temporary_path.unlink()
 
 
+def _recover_from_fp16_overflow(scaler, optimizer) -> tuple[float, float]:
+    """让 GradScaler 跳过溢出的更新并降低 scale，而不是让训练直接退出。"""
+    scale_before = float(scaler.get_scale())
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
+    return scale_before, float(scaler.get_scale())
+
+
 def resolve_device(device_name: str) -> torch.device:
     if device_name.startswith("cuda") and not torch.cuda.is_available():
         print("未检测到 CUDA，自动切换到 CPU。")
@@ -252,7 +261,7 @@ def train_model(
     """MiniMind 风格的单卡训练循环。"""
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     use_scaler = device.type == "cuda" and dtype == torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_scaler)
     writer = None
     if tensorboard_dir:
         try:
@@ -278,6 +287,7 @@ def train_model(
     stop_training = False
     current_epoch = start_epoch
     last_update_batch = resume_batch
+    consecutive_fp16_overflows = 0
 
     try:
         for epoch in range(start_epoch, epochs):
@@ -319,6 +329,19 @@ def train_model(
                 scaler.unscale_(optimizer)
                 grad_norm = clip_grad_norm_(model.parameters(), grad_clip)
                 if not torch.isfinite(grad_norm).item():
+                    if use_scaler:
+                        scale_before, scale_after = _recover_from_fp16_overflow(scaler, optimizer)
+                        consecutive_fp16_overflows += 1
+                        print(
+                            f"检测到 FP16 梯度溢出，已跳过 batch={batch_index} 的更新，"
+                            f"GradScaler scale: {scale_before:.0f} -> {scale_after:.0f}。"
+                        )
+                        if consecutive_fp16_overflows >= 8:
+                            raise FloatingPointError(
+                                "连续 8 次 FP16 梯度溢出，训练未能自行恢复。"
+                            )
+                        continue
+
                     optimizer.zero_grad(set_to_none=True)
                     raise FloatingPointError(
                         f"梯度范数变为非有限值：stage={stage}, epoch={epoch + 1}, "
@@ -338,6 +361,7 @@ def train_model(
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                consecutive_fp16_overflows = 0
                 global_step += 1
                 last_update_batch = batch_index
 

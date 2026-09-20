@@ -272,7 +272,7 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
 
 训练循环会周期性保存 checkpoint。运行中按 `Ctrl+C` 会先保存当前安全状态；也可以使用 `--save_interval` 定期保存。
 
-恢复训练时尽量保持模型结构、`max_seq_len`、`batch_size`、`accumulation_steps` 和学习率调度参数不变。如果要比较另一组训练参数，建议使用新的 `output_dir`，避免把不同实验混在同一个可恢复 checkpoint 中。训练发现非有限 loss 或梯度时会主动停止，并拒绝用坏权重覆盖已有 checkpoint。
+恢复训练时尽量保持模型结构、`max_seq_len`、`batch_size`、`accumulation_steps` 和学习率调度参数不变。如果要比较另一组训练参数，建议使用新的 `output_dir`，避免把不同实验混在同一个可恢复 checkpoint 中。训练发现非有限 loss 时会主动停止，并拒绝用坏权重覆盖已有 checkpoint；FP16 的单次梯度溢出则由 GradScaler 自动跳过并降低 scale，连续多次无法恢复才会停止。
 
 ```powershell
 & $trainPy -m trainer.train_pretrain `

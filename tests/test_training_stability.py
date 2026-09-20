@@ -8,7 +8,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from minimind_lab.config import MiniMindConfig
-from trainer.trainer_utils import cosine_learning_rate, save_checkpoint, train_model
+from trainer.trainer_utils import (
+    _recover_from_fp16_overflow,
+    cosine_learning_rate,
+    save_checkpoint,
+    train_model,
+)
 
 
 class OneBatchDataset(Dataset):
@@ -30,7 +35,41 @@ class NaNLossModel(nn.Module):
         return SimpleNamespace(loss=loss, aux_loss=torch.zeros_like(loss))
 
 
+class FakeOptimizer:
+    def __init__(self) -> None:
+        self.zero_grad_called = False
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self.zero_grad_called = True
+
+
+class FakeScaler:
+    def __init__(self, scale: float) -> None:
+        self.scale = scale
+        self.step_called = False
+
+    def get_scale(self) -> float:
+        return self.scale
+
+    def step(self, optimizer) -> None:
+        self.step_called = True
+
+    def update(self) -> None:
+        self.scale /= 2
+
+
 class TrainingStabilityTest(unittest.TestCase):
+    def test_fp16_overflow_is_skipped_and_scaler_backs_off(self):
+        scaler = FakeScaler(scale=131072)
+        optimizer = FakeOptimizer()
+
+        scale_before, scale_after = _recover_from_fp16_overflow(scaler, optimizer)
+
+        self.assertEqual(scale_before, 131072)
+        self.assertEqual(scale_after, 65536)
+        self.assertTrue(scaler.step_called)
+        self.assertTrue(optimizer.zero_grad_called)
+
     def test_cosine_schedule_warms_up_and_reaches_floor(self):
         base_lr = 3e-4
         warmup_steps = 100
@@ -50,7 +89,7 @@ class TrainingStabilityTest(unittest.TestCase):
         model = nn.Linear(2, 2)
         model.weight.data.fill_(float("nan"))
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        scaler = torch.cuda.amp.GradScaler(enabled=False)
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
         config = MiniMindConfig(
             vocab_size=8,
             hidden_size=4,
