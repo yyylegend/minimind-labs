@@ -55,6 +55,7 @@ minimind-labs/
 │   └── causal_lm.py               # Embedding、Block、LM Head、生成
 ├── trainer/
 │   ├── __init__.py
+│   ├── metrics.py                # 滚动吞吐、ETA、padding 与稳定性指标
 │   ├── trainer_utils.py           # 设备、精度、checkpoint、训练循环
 │   ├── train_pretrain.py          # 预训练入口
 │   └── train_sft.py               # SFT 入口
@@ -302,6 +303,32 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
 ```
 
 然后打开 <http://localhost:6006>。
+
+### 如何读 TensorBoard 指标
+
+训练吞吐不再只看一个笼统的 `tokens/s`，而是按最近 100 次成功 optimizer 更新计算滚动平均。恢复训练后，旧 run 的 step 不会混进新的 ETA。
+
+```text
+throughput/raw_tokens_per_second
+→ 模型实际计算的张量位置，包含 padding；适合判断硬件吞吐。
+
+throughput/valid_tokens_per_second
+→ 非 padding 的真实文本 token；适合判断数据利用率。
+
+throughput/target_tokens_per_second
+→ 真正参与 next-token loss 的标签 token；SFT 最应关注这一项。
+
+data/padding_ratio
+→ 当前窗口中被 padding 占用的比例，越高说明固定长度带来的算力浪费越多。
+
+data/target_token_ratio
+→ 有效文本中实际参与监督的比例；SFT 过低时要检查 assistant 标签和对话模板。
+
+train/grad_norm、stability/grad_scaler_scale、stability/fp16_overflow_total
+→ 分别用于观察梯度大小、FP16 缩放和溢出恢复情况。
+```
+
+控制台中的 `tok/s(raw/valid/target)` 与这些曲线一致。`raw` 高但 `valid` 或 `target` 很低时，优先检查 padding、截断和标签掩码，而不是只加大 batch size。
 
 ## 输出文件
 

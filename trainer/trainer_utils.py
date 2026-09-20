@@ -5,11 +5,12 @@ from dataclasses import asdict
 import math
 from pathlib import Path
 import random
-import time
 
 import torch
 from torch.utils.data import DataLoader, Sampler, Subset
 from torch.nn.utils import clip_grad_norm_
+
+from trainer.metrics import TrainingMetrics
 
 
 class EpochRandomSampler(Sampler[int]):
@@ -282,8 +283,7 @@ def train_model(
     batches_per_epoch = len(dataloader)
     steps_per_epoch = math.ceil(batches_per_epoch / accumulation_steps)
     total_steps = max_steps if max_steps > 0 else steps_per_epoch * epochs
-    started_at = time.perf_counter()
-    tokens_seen = 0
+    metrics = TrainingMetrics(start_step=global_step)
     stop_training = False
     current_epoch = start_epoch
     last_update_batch = resume_batch
@@ -304,10 +304,13 @@ def train_model(
             for local_batch_index, batch in enumerate(epoch_dataloader, start=1):
                 batch_index = skip_batches + local_batch_index
 
-                input_ids = batch["input_ids"].to(device, non_blocking=True)
-                labels = batch["labels"].to(device, non_blocking=True)
-                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-                tokens_seen += input_ids.numel()
+                input_ids = batch["input_ids"]
+                labels = batch["labels"]
+                attention_mask = batch["attention_mask"]
+                metrics.record_batch(input_ids, attention_mask, labels)
+                input_ids = input_ids.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                attention_mask = attention_mask.to(device, non_blocking=True)
 
                 with autocast_context(device, dtype):
                     outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
@@ -331,6 +334,7 @@ def train_model(
                 if not torch.isfinite(grad_norm).item():
                     if use_scaler:
                         scale_before, scale_after = _recover_from_fp16_overflow(scaler, optimizer)
+                        metrics.record_fp16_overflow()
                         consecutive_fp16_overflows += 1
                         print(
                             f"检测到 FP16 梯度溢出，已跳过 batch={batch_index} 的更新，"
@@ -364,19 +368,45 @@ def train_model(
                 consecutive_fp16_overflows = 0
                 global_step += 1
                 last_update_batch = batch_index
-
-                elapsed = time.perf_counter() - started_at
-                steps_per_second = global_step / elapsed if elapsed > 0 else 0.0
-                remaining = (total_steps - global_step) / steps_per_second if steps_per_second else float("inf")
-                tokens_per_second = tokens_seen / elapsed if elapsed > 0 else 0.0
+                metrics_snapshot = metrics.record_update(global_step, total_steps)
                 if global_step % log_interval == 0 or batch_index == batches_per_epoch:
+                    grad_norm_value = float(grad_norm.item())
+                    scaler_scale = float(scaler.get_scale())
                     if writer is not None:
                         writer.add_scalar("train/loss", loss.item(), global_step)
                         writer.add_scalar("train/learning_rate", current_lr, global_step)
-                        writer.add_scalar("train/tokens_per_second", tokens_per_second, global_step)
-                        if math.isfinite(remaining):
-                            writer.add_scalar("train/eta_seconds", remaining, global_step)
-                        if device.type == "cuda":
+                        writer.add_scalar(
+                            "train/tokens_per_second",
+                            metrics_snapshot.raw_tokens_per_second,
+                            global_step,
+                        )
+                        writer.add_scalar(
+                            "throughput/raw_tokens_per_second",
+                            metrics_snapshot.raw_tokens_per_second,
+                            global_step,
+                        )
+                        writer.add_scalar(
+                            "throughput/valid_tokens_per_second",
+                            metrics_snapshot.valid_tokens_per_second,
+                            global_step,
+                        )
+                        writer.add_scalar(
+                            "throughput/target_tokens_per_second",
+                            metrics_snapshot.target_tokens_per_second,
+                            global_step,
+                        )
+                        writer.add_scalar("data/padding_ratio", metrics_snapshot.padding_ratio, global_step)
+                        writer.add_scalar("data/target_token_ratio", metrics_snapshot.target_token_ratio, global_step)
+                        writer.add_scalar("train/grad_norm", grad_norm_value, global_step)
+                        writer.add_scalar("stability/grad_scaler_scale", scaler_scale, global_step)
+                        writer.add_scalar(
+                            "stability/fp16_overflow_total",
+                            metrics_snapshot.fp16_overflow_total,
+                            global_step,
+                        )
+                        if math.isfinite(metrics_snapshot.eta_seconds):
+                            writer.add_scalar("progress/eta_seconds", metrics_snapshot.eta_seconds, global_step)
+                    if device.type == "cuda":
                             writer.add_scalar(
                                 "system/gpu_memory_allocated_gb",
                                 torch.cuda.memory_allocated(device) / 1024**3,
@@ -385,7 +415,13 @@ def train_model(
                     print(
                         f"stage={stage} epoch={epoch + 1}/{epochs} "
                         f"step={global_step}/{total_steps} loss={loss.item():.4f} "
-                        f"tok/s={tokens_per_second:.0f} eta={format_duration(remaining)}"
+                        f"tok/s(raw/valid/target)="
+                        f"{metrics_snapshot.raw_tokens_per_second:.0f}/"
+                        f"{metrics_snapshot.valid_tokens_per_second:.0f}/"
+                        f"{metrics_snapshot.target_tokens_per_second:.0f} "
+                        f"pad={metrics_snapshot.padding_ratio:.1%} grad={grad_norm_value:.3f} "
+                        f"scale={scaler_scale:.0f} ovf={metrics_snapshot.fp16_overflow_total} "
+                        f"eta={format_duration(metrics_snapshot.eta_seconds)}"
                     )
                 if save_interval > 0 and global_step % save_interval == 0:
                     save_checkpoint(
