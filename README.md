@@ -28,6 +28,7 @@ Pretrain → SFT → 评测 / 部署
 - 保留手写 Attention，便于理解 Q/K/V、RoPE、GQA 和 KV Cache
 - 支持 PyTorch 融合 Attention 路径，用于实际训练
 - 支持 next-token prediction、预训练和监督微调
+- 使用 MiniMind 风格的权重初始化，控制初始 logits 的数值尺度
 - 支持断点恢复、训练进度、速度和预计剩余时间
 - 支持 TensorBoard 观察 loss、学习率、吞吐量和显存
 - 输出 MiniMind 风格的纯模型权重，便于后续评测或部署
@@ -164,6 +165,8 @@ batch_size × max_seq_len × accumulation_steps
 ```
 
 训练器会对学习率先做 warmup，再进行 cosine decay。预训练基线使用 `3e-4` 的峰值学习率，训练结束时降到峰值的 `10%`；SFT 使用更小的峰值学习率。这样可以降低 FP16 长时间训练后逐渐发散的风险。
+
+模型的线性层和词嵌入默认使用 `initializer_range=0.02`。如果初始 loss 异常高，优先检查初始化、精度和学习率，而不是盲目增大 batch size。
 
 如果显存不足，优先保持 `max_seq_len=768`，只缩小单次 batch，并用梯度累积补回来：
 

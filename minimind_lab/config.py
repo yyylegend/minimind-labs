@@ -20,6 +20,7 @@ class MiniMindConfig:
     rope_theta: float = 1e6
     flash_attn: bool = True
     tie_word_embeddings: bool = True
+    initializer_range: float = 0.02
     use_moe: bool = False
     bos_token_id: int = 1
     eos_token_id: int = 2

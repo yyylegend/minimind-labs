@@ -32,6 +32,24 @@ class CausalLMTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(outputs.loss))
         self.assertTrue(torch.isfinite(model.model.embed_tokens.weight.grad).all())
 
+    def test_initialization_keeps_logits_and_loss_in_reasonable_range(self) -> None:
+        config = MiniMindConfig(
+            vocab_size=6400,
+            hidden_size=512,
+            num_hidden_layers=2,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            max_position_embeddings=16,
+            flash_attn=False,
+        )
+        model = MiniMindForCausalLM(config)
+        input_ids = torch.randint(0, config.vocab_size, (1, 16))
+        outputs = model(input_ids, labels=input_ids)
+
+        self.assertLess(model.model.embed_tokens.weight.std().item(), 0.05)
+        self.assertLess(outputs.logits.float().std().item(), 2.0)
+        self.assertLess(outputs.loss.item(), 20.0)
+
     def test_lm_head_can_share_embedding_weights(self) -> None:
         model = self.make_model()
 

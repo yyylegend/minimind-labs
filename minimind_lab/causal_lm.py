@@ -106,9 +106,20 @@ class MiniMindForCausalLM(nn.Module):
         super().__init__()
         self.config = config or MiniMindConfig()
         self.model = MiniMindModel(self.config)
+        self.model.apply(self._init_weights)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        self._init_weights(self.lm_head)
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+
+    def _init_weights(self, module: nn.Module) -> None:
+        """使用 MiniMind/HuggingFace 风格的小方差初始化，避免初始 logits 过大。"""
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
 
     def forward(
         self,
