@@ -1,0 +1,4 @@
+# PyTorch 请按本机 CUDA 版本单独安装，不在这里强行指定 wheel。
+transformers==4.57.6
+datasets==3.6.0
+tensorboard
