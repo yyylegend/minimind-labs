@@ -142,6 +142,36 @@ SFT：学习问答格式、指令遵循和任务行为
 固定评测集：比较训练前后的能力变化
 ```
 
+### 参数选择：通用单卡基线
+
+本项目默认使用 MiniMind 的 `pretrain_t2t_mini.jsonl` 和 `sft_t2t_mini.jsonl`。MiniMind 官方对这两份 mini 数据都建议将 `max_seq_len` 设置在约 `768` tokens，并提醒过短会截断语义、过长会增加 padding 和计算浪费。[官方数据说明](https://github.com/jingyaogong/minimind/blob/master/README.md?plain=1#L2879-L2903)
+
+因此，正式训练可以先从下面这组与硬件无关的单卡基线开始：
+
+```text
+max_seq_len=768
+batch_size=8
+accumulation_steps=1
+```
+
+这里的有效 token batch 可以粗略理解为：
+
+```text
+batch_size × max_seq_len × accumulation_steps
+8 × 768 × 1 = 6144 tokens/update
+```
+
+如果显存不足，优先保持 `max_seq_len=768`，只缩小单次 batch，并用梯度累积补回来：
+
+```text
+显存较紧：batch_size=4，accumulation_steps=2
+显存更紧：batch_size=2，accumulation_steps=4
+```
+
+这几组配置的有效 token batch 接近，便于比较训练结果。实际可用值仍取决于模型大小、精度、Attention 实现和 GPU 显存；不要把官方训练脚本的默认 `batch_size` 直接当成所有机器的要求。
+
+如果使用自己的数据集，应先观察样本长度分布：序列太短会丢失长样本的上下文，序列太长则会让大量短样本 padding。调整参数时一次只改变一个主要因素，并同时记录 `tok/s`、loss 和固定评测集结果。
+
 ### 1. 先做 smoke test
 
 先用小模型和两个 step 验证 tokenizer、数据集、前向、反向和 checkpoint 链路：
@@ -168,7 +198,7 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
 
 ### 2. 单卡预训练
 
-下面是一组适合作为起点的单卡配置。显存不足时，优先降低 `batch_size` 或 `max_seq_len`；显存充足时再提高它们。
+下面是一组适合作为起点的通用单卡配置。它与上面的基线一致；显存不足时按上面的回退规则调整。
 
 ```powershell
 & $trainPy -m trainer.train_pretrain `
@@ -182,9 +212,9 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
   --num_hidden_layers 8 `
   --num_attention_heads 8 `
   --num_key_value_heads 4 `
-  --max_seq_len 512 `
-  --batch_size 2 `
-  --accumulation_steps 8 `
+  --max_seq_len 768 `
+  --batch_size 8 `
+  --accumulation_steps 1 `
   --epochs 1 `
   --learning_rate 5e-4 `
   --grad_clip 1.0 `
@@ -213,9 +243,9 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
   --num_hidden_layers 8 `
   --num_attention_heads 8 `
   --num_key_value_heads 4 `
-  --max_seq_len 1024 `
-  --batch_size 2 `
-  --accumulation_steps 4 `
+  --max_seq_len 768 `
+  --batch_size 8 `
+  --accumulation_steps 1 `
   --epochs 1 `
   --learning_rate 5e-5 `
   --grad_clip 1.0 `
@@ -225,11 +255,13 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
   --num_workers 0
 ```
 
-模型结构参数需要和预训练阶段保持一致。实际训练时应根据数据规模、显存和评测结果调整学习率、序列长度和训练轮数。
+模型结构参数需要和预训练阶段保持一致。预训练和 SFT 都可以先使用 `max_seq_len=768`；如果 SFT 样本明显更长，再单独提高 SFT 的序列长度，并重新测量吞吐量和显存。实际训练时还应根据数据规模和评测结果调整学习率与训练轮数。
 
 ## 暂停、恢复和监控
 
 训练循环会周期性保存 checkpoint。运行中按 `Ctrl+C` 会先保存当前安全状态；也可以使用 `--save_interval` 定期保存。
+
+恢复训练时尽量保持模型结构、`max_seq_len`、`batch_size` 和 `accumulation_steps` 不变。如果要比较另一组训练参数，建议使用新的 `output_dir`，避免把不同实验混在同一个可恢复 checkpoint 中。
 
 ```powershell
 & $trainPy -m trainer.train_pretrain `
@@ -244,9 +276,9 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
   --num_hidden_layers 8 `
   --num_attention_heads 8 `
   --num_key_value_heads 4 `
-  --max_seq_len 512 `
-  --batch_size 2 `
-  --accumulation_steps 8 `
+  --max_seq_len 768 `
+  --batch_size 8 `
+  --accumulation_steps 1 `
   --num_workers 0
 ```
 
