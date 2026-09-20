@@ -152,6 +152,8 @@ SFT：学习问答格式、指令遵循和任务行为
 max_seq_len=768
 batch_size=8
 accumulation_steps=1
+warmup_steps=1000
+min_lr_ratio=0.1
 ```
 
 这里的有效 token batch 可以粗略理解为：
@@ -160,6 +162,8 @@ accumulation_steps=1
 batch_size × max_seq_len × accumulation_steps
 8 × 768 × 1 = 6144 tokens/update
 ```
+
+训练器会对学习率先做 warmup，再进行 cosine decay。预训练基线使用 `3e-4` 的峰值学习率，训练结束时降到峰值的 `10%`；SFT 使用更小的峰值学习率。这样可以降低 FP16 长时间训练后逐渐发散的风险。
 
 如果显存不足，优先保持 `max_seq_len=768`，只缩小单次 batch，并用梯度累积补回来：
 
@@ -215,8 +219,10 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
   --max_seq_len 768 `
   --batch_size 8 `
   --accumulation_steps 1 `
+  --warmup_steps 1000 `
+  --min_lr_ratio 0.1 `
   --epochs 1 `
-  --learning_rate 5e-4 `
+  --learning_rate 3e-4 `
   --grad_clip 1.0 `
   --save_interval 100 `
   --max_steps 0 `
@@ -246,6 +252,8 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
   --max_seq_len 768 `
   --batch_size 8 `
   --accumulation_steps 1 `
+  --warmup_steps 500 `
+  --min_lr_ratio 0.1 `
   --epochs 1 `
   --learning_rate 5e-5 `
   --grad_clip 1.0 `
@@ -261,7 +269,7 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
 
 训练循环会周期性保存 checkpoint。运行中按 `Ctrl+C` 会先保存当前安全状态；也可以使用 `--save_interval` 定期保存。
 
-恢复训练时尽量保持模型结构、`max_seq_len`、`batch_size` 和 `accumulation_steps` 不变。如果要比较另一组训练参数，建议使用新的 `output_dir`，避免把不同实验混在同一个可恢复 checkpoint 中。
+恢复训练时尽量保持模型结构、`max_seq_len`、`batch_size`、`accumulation_steps` 和学习率调度参数不变。如果要比较另一组训练参数，建议使用新的 `output_dir`，避免把不同实验混在同一个可恢复 checkpoint 中。训练发现非有限 loss 或梯度时会主动停止，并拒绝用坏权重覆盖已有 checkpoint。
 
 ```powershell
 & $trainPy -m trainer.train_pretrain `
@@ -279,6 +287,8 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
   --max_seq_len 768 `
   --batch_size 8 `
   --accumulation_steps 1 `
+  --warmup_steps 1000 `
+  --min_lr_ratio 0.1 `
   --num_workers 0
 ```
 

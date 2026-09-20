@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
     parser.add_argument("--accumulation_steps", type=int, default=4)
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--save_interval", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=0, help="只跑指定 optimizer steps，0 表示完整训练")
@@ -92,6 +94,8 @@ def main() -> None:
         log_interval=args.log_interval,
         resume_checkpoint=args.resume_checkpoint,
         tensorboard_dir=args.tensorboard_dir,
+        warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
     )
 
 

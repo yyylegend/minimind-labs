@@ -73,6 +73,68 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}m{seconds:02d}s"
 
 
+def cosine_learning_rate(
+    step: int,
+    total_steps: int,
+    base_lr: float,
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.1,
+) -> float:
+    """返回带线性 warmup 和 cosine decay 的当前学习率。"""
+    if total_steps <= 0:
+        return base_lr
+    if base_lr < 0:
+        raise ValueError("base_lr 不能小于 0")
+    if not 0 <= min_lr_ratio <= 1:
+        raise ValueError("min_lr_ratio 必须在 [0, 1] 范围内")
+
+    step = max(0, min(step, total_steps))
+    warmup_steps = max(0, min(warmup_steps, total_steps))
+    if warmup_steps and step < warmup_steps:
+        return base_lr * step / warmup_steps
+
+    decay_steps = max(total_steps - warmup_steps, 1)
+    progress = (step - warmup_steps) / decay_steps
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
+
+
+def _nonfinite_names(tensors) -> list[str]:
+    return [
+        name
+        for name, value in tensors
+        if torch.is_tensor(value)
+        and value.is_floating_point()
+        and not torch.isfinite(value).all().item()
+    ]
+
+
+def _assert_finite_model(model) -> None:
+    bad_names = _nonfinite_names(model.state_dict().items())
+    if bad_names:
+        raise FloatingPointError(f"模型包含非有限权重，拒绝继续训练或保存：{bad_names[:5]}")
+
+
+def _assert_finite_optimizer(optimizer) -> None:
+    bad_names = []
+    for parameter_id, state in optimizer.state.items():
+        bad_names.extend(
+            (f"{parameter_id}.{name}" for name in _nonfinite_names(state.items()))
+        )
+    if bad_names:
+        raise FloatingPointError(f"优化器状态包含非有限值：{bad_names[:5]}")
+
+
+def _atomic_torch_save(value, path: Path) -> None:
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    try:
+        torch.save(value, temporary_path)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 def resolve_device(device_name: str) -> torch.device:
     if device_name.startswith("cuda") and not torch.cuda.is_available():
         print("未检测到 CUDA，自动切换到 CPU。")
@@ -112,19 +174,26 @@ def save_checkpoint(
     batch_index: int = 0,
 ) -> Path:
     """同时保存模型权重和恢复训练所需的优化器状态。"""
+    _assert_finite_model(model)
+    _assert_finite_optimizer(optimizer)
+    scaler_state = scaler.state_dict()
+    scaler_scale = scaler_state.get("scale")
+    if scaler_scale is not None and (not math.isfinite(scaler_scale) or scaler_scale <= 0):
+        raise FloatingPointError(f"GradScaler 状态异常：scale={scaler_scale}")
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_path / f"{stage}_last.pt"
     state = {
         "model": {name: value.detach().cpu() for name, value in model.state_dict().items()},
         "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict(),
+        "scaler": scaler_state,
         "config": asdict(config),
         "epoch": epoch,
         "step": step,
         "batch_index": batch_index,
     }
-    torch.save(state, checkpoint_path)
+    _atomic_torch_save(state, checkpoint_path)
 
     # 同时保存官方 MiniMind 风格的纯权重文件：官方训练器只需要这个 state_dict。
     official_stage = "full_sft" if stage == "sft" else stage
@@ -133,7 +202,7 @@ def save_checkpoint(
         name: value.detach().half().cpu()
         for name, value in model.state_dict().items()
     }
-    torch.save(official_state, official_path)
+    _atomic_torch_save(official_state, official_path)
     return checkpoint_path
 
 
@@ -142,6 +211,7 @@ def load_model_weights(model, checkpoint_path: str, device: torch.device) -> Non
     checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get("model", checkpoint)
     model.load_state_dict(state_dict, strict=False)
+    _assert_finite_model(model)
 
 
 def load_training_checkpoint(model, optimizer, scaler, checkpoint_path: str, device: torch.device):
@@ -150,6 +220,8 @@ def load_training_checkpoint(model, optimizer, scaler, checkpoint_path: str, dev
     model.load_state_dict(checkpoint["model"], strict=False)
     optimizer.load_state_dict(checkpoint["optimizer"])
     scaler.load_state_dict(checkpoint.get("scaler", {}))
+    _assert_finite_model(model)
+    _assert_finite_optimizer(optimizer)
     return (
         int(checkpoint.get("epoch", 0)),
         int(checkpoint.get("step", 0)),
@@ -174,6 +246,8 @@ def train_model(
     log_interval: int = 10,
     resume_checkpoint: str = "",
     tensorboard_dir: str = "",
+    warmup_steps: int = 0,
+    min_lr_ratio: float = 0.1,
 ) -> None:
     """MiniMind 风格的单卡训练循环。"""
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -230,13 +304,37 @@ def train_model(
                     loss = outputs.loss + outputs.aux_loss
                     scaled_loss = loss / accumulation_steps
 
+                if not torch.isfinite(loss.detach()).item():
+                    optimizer.zero_grad(set_to_none=True)
+                    raise FloatingPointError(
+                        f"loss 变为非有限值：stage={stage}, epoch={epoch + 1}, "
+                        f"batch={batch_index}, step={global_step}。请降低学习率或检查数据。"
+                    )
+
                 scaler.scale(scaled_loss).backward()
                 should_update = batch_index % accumulation_steps == 0 or batch_index == batches_per_epoch
                 if not should_update:
                     continue
 
                 scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), grad_clip)
+                grad_norm = clip_grad_norm_(model.parameters(), grad_clip)
+                if not torch.isfinite(grad_norm).item():
+                    optimizer.zero_grad(set_to_none=True)
+                    raise FloatingPointError(
+                        f"梯度范数变为非有限值：stage={stage}, epoch={epoch + 1}, "
+                        f"batch={batch_index}, step={global_step}。请降低学习率或检查精度。"
+                    )
+
+                next_step = global_step + 1
+                current_lr = cosine_learning_rate(
+                    next_step,
+                    total_steps,
+                    learning_rate,
+                    warmup_steps=warmup_steps,
+                    min_lr_ratio=min_lr_ratio,
+                )
+                for parameter_group in optimizer.param_groups:
+                    parameter_group["lr"] = current_lr
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -250,7 +348,7 @@ def train_model(
                 if global_step % log_interval == 0 or batch_index == batches_per_epoch:
                     if writer is not None:
                         writer.add_scalar("train/loss", loss.item(), global_step)
-                        writer.add_scalar("train/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+                        writer.add_scalar("train/learning_rate", current_lr, global_step)
                         writer.add_scalar("train/tokens_per_second", tokens_per_second, global_step)
                         if math.isfinite(remaining):
                             writer.add_scalar("train/eta_seconds", remaining, global_step)
