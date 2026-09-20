@@ -2,7 +2,7 @@
 
 一个用于学习和复现小型 Decoder-only Transformer 的独立实验项目。
 
-本项目以 [MiniMind](https://github.com/jingyaogong/minimind) 的模型结构、配置方式和训练思路作为主要参考，但代码、实验和训练输出均放在本仓库中维护。原始 MiniMind 仓库作为只读对照，不直接修改。
+本项目明确参考 [MiniMind](https://github.com/jingyaogong/minimind) 的模型结构、配置方式、训练流程和权重格式。它是面向学习的独立实现，不是 MiniMind 官方仓库或官方发布版本；代码、实验和训练输出均放在本仓库中维护，原始 MiniMind 仓库仅作为只读对照。
 
 项目的目标是把一个语言模型拆成可以单独理解、测试和组装的模块，并最终跑通：
 
