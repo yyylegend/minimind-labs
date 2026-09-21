@@ -258,6 +258,8 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
   --accumulation_steps 1 `
   --warmup_steps 500 `
   --min_lr_ratio 0.1 `
+  --eval_ratio 0.02 `
+  --eval_interval 500 `
   --epochs 1 `
   --learning_rate 5e-5 `
   --grad_clip 1.0 `
@@ -268,6 +270,8 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
 ```
 
 模型结构参数需要和预训练阶段保持一致。预训练和 SFT 都可以先使用 `max_seq_len=768`；如果 SFT 样本明显更长，再单独提高 SFT 的序列长度，并重新测量吞吐量和显存。实际训练时还应根据数据规模和评测结果调整学习率与训练轮数。
+
+SFT 默认固定划分 2% 数据作为验证集，只对 assistant target token 计算验证 loss。验证 loss 创新低时会额外保存 `full_sft_best_<hidden_size>.pth`；`full_sft_<hidden_size>.pth` 仍表示最近一次保存的模型。
 
 ## 暂停、恢复和监控
 

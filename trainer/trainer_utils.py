@@ -208,19 +208,31 @@ def save_checkpoint(
     # 同时保存官方 MiniMind 风格的纯权重文件：官方训练器只需要这个 state_dict。
     official_stage = "full_sft" if stage == "sft" else stage
     official_path = output_path / f"{official_stage}_{config.hidden_size}.pth"
-    official_state = {
+    save_model_weights(model, official_path)
+    return checkpoint_path
+
+
+def save_model_weights(model, output_path: str | Path) -> Path:
+    """只保存纯模型权重，适合部署或保存验证集上的最佳模型。"""
+    _assert_finite_model(model)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    state_dict = {
         name: value.detach().half().cpu()
         for name, value in model.state_dict().items()
     }
-    _atomic_torch_save(official_state, official_path)
-    return checkpoint_path
+    _atomic_torch_save(state_dict, output_path)
+    return output_path
 
 
 def load_model_weights(model, checkpoint_path: str, device: torch.device) -> None:
     """加载已有模型权重，可用于从 Pretrain 开始 SFT。"""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # 初始化 SFT 只需要模型参数；不要把 pretrain_last.pt 里的 AdamW/Scaler 状态搬到 GPU。
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = checkpoint.get("model", checkpoint)
-    model.load_state_dict(state_dict, strict=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise ValueError(f"初始化权重结构不匹配：missing={missing[:5]}, unexpected={unexpected[:5]}")
     _assert_finite_model(model)
 
 
@@ -237,6 +249,46 @@ def load_training_checkpoint(model, optimizer, scaler, checkpoint_path: str, dev
         int(checkpoint.get("step", 0)),
         int(checkpoint.get("batch_index", 0)),
     )
+
+
+@torch.no_grad()
+def evaluate_model(model, dataloader, device: torch.device, dtype: torch.dtype, require_targets: bool = False):
+    """按有效 target token 加权计算验证 loss。"""
+    was_training = model.training
+    model.eval()
+    loss_sum = 0.0
+    target_tokens = 0
+    try:
+        for batch in dataloader:
+            input_ids = batch["input_ids"]
+            labels = batch["labels"]
+            attention_mask = batch["attention_mask"]
+            target_counts = labels[..., 1:].ne(-100).sum(dim=-1)
+            if require_targets and (target_counts == 0).any().item():
+                bad_rows = (target_counts == 0).nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(f"验证集存在没有有效 assistant target 的样本：rows={bad_rows}")
+
+            batch_targets = int(target_counts.sum().item())
+            if batch_targets == 0:
+                continue
+            with autocast_context(device, dtype):
+                outputs = model(
+                    input_ids.to(device, non_blocking=True),
+                    attention_mask=attention_mask.to(device, non_blocking=True),
+                    labels=labels.to(device, non_blocking=True),
+                )
+            loss = outputs.loss + outputs.aux_loss
+            if not torch.isfinite(loss).item():
+                raise FloatingPointError("验证 loss 变为非有限值")
+            loss_sum += float(loss.item()) * batch_targets
+            target_tokens += batch_targets
+    finally:
+        if was_training:
+            model.train()
+
+    if target_tokens == 0:
+        raise ValueError("验证集没有任何有效 target token")
+    return loss_sum / target_tokens, target_tokens
 
 
 def train_model(
@@ -258,6 +310,9 @@ def train_model(
     tensorboard_dir: str = "",
     warmup_steps: int = 0,
     min_lr_ratio: float = 0.1,
+    eval_dataloader=None,
+    eval_interval: int = 0,
+    require_targets: bool = False,
 ) -> None:
     """MiniMind 风格的单卡训练循环。"""
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -284,6 +339,7 @@ def train_model(
     steps_per_epoch = math.ceil(batches_per_epoch / accumulation_steps)
     total_steps = max_steps if max_steps > 0 else steps_per_epoch * epochs
     metrics = TrainingMetrics(start_step=global_step)
+    best_eval_loss = math.inf
     stop_training = False
     current_epoch = start_epoch
     last_update_batch = resume_batch
@@ -307,6 +363,13 @@ def train_model(
                 input_ids = batch["input_ids"]
                 labels = batch["labels"]
                 attention_mask = batch["attention_mask"]
+                if require_targets:
+                    target_counts = labels[..., 1:].ne(-100).sum(dim=-1)
+                    if (target_counts == 0).any().item():
+                        bad_rows = (target_counts == 0).nonzero(as_tuple=False).flatten().tolist()
+                        raise ValueError(
+                            f"SFT batch 中存在没有有效 assistant target 的样本：rows={bad_rows}"
+                        )
                 metrics.record_batch(input_ids, attention_mask, labels)
                 input_ids = input_ids.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
@@ -428,6 +491,27 @@ def train_model(
                         model, optimizer, scaler, config, output_dir, stage,
                         epoch, global_step, batch_index,
                     )
+                if eval_dataloader is not None and eval_interval > 0 and global_step % eval_interval == 0:
+                    eval_loss, eval_target_tokens = evaluate_model(
+                        model,
+                        eval_dataloader,
+                        device,
+                        dtype,
+                        require_targets=require_targets,
+                    )
+                    if writer is not None:
+                        writer.add_scalar("eval/loss", eval_loss, global_step)
+                        writer.add_scalar("eval/target_tokens", eval_target_tokens, global_step)
+                    print(
+                        f"eval step={global_step} loss={eval_loss:.4f} "
+                        f"target_tokens={eval_target_tokens}"
+                    )
+                    if eval_loss < best_eval_loss:
+                        best_eval_loss = eval_loss
+                        save_model_weights(
+                            model,
+                            Path(output_dir) / f"full_sft_best_{config.hidden_size}.pth",
+                        )
                 if max_steps > 0 and global_step >= max_steps:
                     stop_training = True
                     break

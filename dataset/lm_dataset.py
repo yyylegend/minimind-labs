@@ -98,10 +98,11 @@ def _postprocess_chat(prompt: str, empty_think_ratio: float = 0.2) -> str:
 class SFTDataset(Dataset):
     """读取 MiniMind 对话 JSONL，只让 assistant 部分参与 loss。"""
 
-    def __init__(self, data_path: str, tokenizer, max_length: int = 1024) -> None:
+    def __init__(self, data_path: str, tokenizer, max_length: int = 1024, augment: bool = True) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.augment = augment
         self.samples = _load_json_dataset(data_path)
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.bos_id = _input_ids(tokenizer(f"{tokenizer.bos_token}assistant\n", add_special_tokens=False))
@@ -148,8 +149,12 @@ class SFTDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         sample = self.samples[index]
-        conversations = _preprocess_chat(sample["conversations"])
-        prompt = _postprocess_chat(self.create_chat_prompt(conversations))
+        conversations = sample["conversations"]
+        if self.augment:
+            conversations = _preprocess_chat(conversations)
+        prompt = self.create_chat_prompt(conversations)
+        if self.augment:
+            prompt = _postprocess_chat(prompt)
         input_ids = _input_ids(self.tokenizer(prompt, add_special_tokens=False))[: self.max_length]
         labels = self.generate_labels(input_ids)
         padding = self.max_length - len(input_ids)

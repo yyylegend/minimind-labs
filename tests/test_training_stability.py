@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ from minimind_lab.config import MiniMindConfig
 from trainer.trainer_utils import (
     _recover_from_fp16_overflow,
     cosine_learning_rate,
+    load_model_weights,
     save_checkpoint,
     train_model,
 )
@@ -23,6 +25,13 @@ class OneBatchDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         ids = torch.tensor([1, 2, 3, 4])
         return {"input_ids": ids, "labels": ids.clone(), "attention_mask": torch.ones_like(ids)}
+
+
+class EmptyTargetDataset(OneBatchDataset):
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        batch = super().__getitem__(index)
+        batch["labels"].fill_(-100)
+        return batch
 
 
 class NaNLossModel(nn.Module):
@@ -59,6 +68,46 @@ class FakeScaler:
 
 
 class TrainingStabilityTest(unittest.TestCase):
+    def test_sft_training_rejects_batch_without_targets(self):
+        config = MiniMindConfig(
+            vocab_size=8,
+            hidden_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            max_position_embeddings=4,
+        )
+        dataloader = DataLoader(EmptyTargetDataset(), batch_size=1, num_workers=0)
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            with self.assertRaises(ValueError):
+                train_model(
+                    model=NaNLossModel(),
+                    dataloader=dataloader,
+                    config=config,
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                    output_dir=output_dir,
+                    stage="sft",
+                    epochs=1,
+                    learning_rate=1e-3,
+                    accumulation_steps=1,
+                    grad_clip=1.0,
+                    save_interval=0,
+                    max_steps=1,
+                    require_targets=True,
+                )
+
+    def test_init_weights_are_loaded_from_cpu(self):
+        source = nn.Linear(2, 2)
+        target = nn.Linear(2, 2)
+        with tempfile.TemporaryDirectory() as output_dir:
+            checkpoint_path = Path(output_dir, "weights.pt")
+            torch.save(source.state_dict(), checkpoint_path)
+            with patch("trainer.trainer_utils.torch.load", wraps=torch.load) as load:
+                load_model_weights(target, str(checkpoint_path), torch.device("cpu"))
+            self.assertEqual(load.call_args.kwargs["map_location"], "cpu")
+
     def test_fp16_overflow_is_skipped_and_scaler_backs_off(self):
         scaler = FakeScaler(scale=131072)
         optimizer = FakeOptimizer()

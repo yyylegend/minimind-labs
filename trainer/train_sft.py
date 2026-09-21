@@ -2,7 +2,8 @@
 
 import argparse
 
-from torch.utils.data import DataLoader
+import torch
+from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer
 
 from dataset.lm_dataset import SFTDataset
@@ -44,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval_ratio", type=float, default=0.02, help="从 SFT 数据中固定划分的验证比例")
+    parser.add_argument("--eval_interval", type=int, default=500, help="每隔多少 optimizer step 计算一次验证 loss")
     return parser
 
 
@@ -68,10 +71,37 @@ def main() -> None:
     if args.init_checkpoint:
         load_model_weights(model, args.init_checkpoint, device)
 
-    dataset = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    sampler = EpochRandomSampler(dataset, seed=args.seed)
+    dataset = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len, augment=True)
+    eval_dataloader = None
+    train_dataset = dataset
+    if not 0 <= args.eval_ratio < 1:
+        raise ValueError("eval_ratio 必须在 [0, 1) 范围内")
+    if args.eval_ratio > 0:
+        generator = torch.Generator().manual_seed(args.seed)
+        indices = torch.randperm(len(dataset), generator=generator).tolist()
+        eval_size = max(1, int(len(dataset) * args.eval_ratio))
+        train_indices = indices[eval_size:]
+        eval_indices = indices[:eval_size]
+        train_dataset = Subset(dataset, train_indices)
+        eval_base = SFTDataset(
+            args.data_path,
+            tokenizer,
+            max_length=args.max_seq_len,
+            augment=False,
+        )
+        eval_dataset = Subset(eval_base, eval_indices)
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+        print(f"SFT 数据划分：train={len(train_dataset)}, eval={len(eval_dataset)}")
+
+    sampler = EpochRandomSampler(train_dataset, seed=args.seed)
     dataloader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size,
         sampler=sampler,
         num_workers=args.num_workers,
@@ -96,6 +126,9 @@ def main() -> None:
         tensorboard_dir=args.tensorboard_dir,
         warmup_steps=args.warmup_steps,
         min_lr_ratio=args.min_lr_ratio,
+        eval_dataloader=eval_dataloader,
+        eval_interval=args.eval_interval,
+        require_targets=True,
     )
 
 
