@@ -190,7 +190,7 @@ $trainPy = (Resolve-Path .\.venv-train\Scripts\python.exe).Path
 & $trainPy -m trainer.train_pretrain `
   --data_path .\data\pretrain_t2t_mini.jsonl `
   --tokenizer_path ..\minimind\model `
-  --output_dir .\out\smoke_pretrain `
+  --output_dir .\out\archive\smoke\pretrain_smoke `
   --tensorboard_dir .\out\runs\smoke_pretrain `
   --device cuda:0 `
   --dtype float16 `
@@ -212,7 +212,7 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
 & $trainPy -m trainer.train_pretrain `
   --data_path .\data\pretrain_t2t_mini.jsonl `
   --tokenizer_path ..\minimind\model `
-  --output_dir .\out\pretrain `
+  --output_dir .\out\checkpoints\pretrain `
   --tensorboard_dir .\out\runs\pretrain `
   --device cuda:0 `
   --dtype float16 `
@@ -244,8 +244,8 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
 & $trainPy -m trainer.train_sft `
   --data_path .\data\sft_t2t_mini.jsonl `
   --tokenizer_path ..\minimind\model `
-  --init_checkpoint .\out\pretrain\pretrain_last.pt `
-  --output_dir .\out\sft `
+  --init_checkpoint .\out\checkpoints\pretrain\pretrain_last.pt `
+  --output_dir .\out\checkpoints\sft `
   --tensorboard_dir .\out\runs\sft `
   --device cuda:0 `
   --dtype float16 `
@@ -281,10 +281,10 @@ SFT 默认固定划分 2% 数据作为验证集，只对 assistant target token 
 
 ```powershell
 & $trainPy -m trainer.train_pretrain `
-  --resume_checkpoint .\out\pretrain\pretrain_last.pt `
+  --resume_checkpoint .\out\checkpoints\pretrain\pretrain_last.pt `
   --data_path .\data\pretrain_t2t_mini.jsonl `
   --tokenizer_path ..\minimind\model `
-  --output_dir .\out\pretrain `
+  --output_dir .\out\checkpoints\pretrain `
   --tensorboard_dir .\out\runs\pretrain `
   --device cuda:0 `
   --dtype float16 `
@@ -354,8 +354,8 @@ pretrain_<hidden_size>.pth / full_sft_<hidden_size>.pth
 
 ```powershell
 & $trainPy -m scripts.export_official_weights `
-  --checkpoint .\out\pretrain\pretrain_last.pt `
-  --output .\out\pretrain\pretrain_512.pth
+  --checkpoint .\out\checkpoints\pretrain\pretrain_last.pt `
+  --output .\out\checkpoints\pretrain\pretrain_512.pth
 ```
 
 只有模型结构、词表和 tokenizer 配置一致时，权重才可以直接交给 MiniMind 的评测或部署脚本使用。
