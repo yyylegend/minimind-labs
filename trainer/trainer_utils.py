@@ -5,6 +5,7 @@ from dataclasses import asdict
 import math
 from pathlib import Path
 import random
+import time
 
 import torch
 from torch.utils.data import DataLoader, Sampler, Subset
@@ -492,6 +493,11 @@ def train_model(
                         epoch, global_step, batch_index,
                     )
                 if eval_dataloader is not None and eval_interval > 0 and global_step % eval_interval == 0:
+                    eval_started_at = time.perf_counter()
+                    print(
+                        f"正在验证：step={global_step}/{total_steps}，"
+                        f"验证 batch={len(eval_dataloader)}，请等待..."
+                    )
                     eval_loss, eval_target_tokens = evaluate_model(
                         model,
                         eval_dataloader,
@@ -504,7 +510,8 @@ def train_model(
                         writer.add_scalar("eval/target_tokens", eval_target_tokens, global_step)
                     print(
                         f"eval step={global_step} loss={eval_loss:.4f} "
-                        f"target_tokens={eval_target_tokens}"
+                        f"target_tokens={eval_target_tokens} "
+                        f"耗时={time.perf_counter() - eval_started_at:.1f}s"
                     )
                     if eval_loss < best_eval_loss:
                         best_eval_loss = eval_loss
