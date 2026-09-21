@@ -8,13 +8,35 @@ import torch
 from torch.utils.data import Dataset
 
 
-def _load_json_dataset(path: str):
+def _load_json_dataset(path: str, features=None):
     """用 HuggingFace datasets 读取 JSONL，避免一次性把大文件读进内存。"""
     try:
         from datasets import load_dataset
     except ImportError as exc:
         raise RuntimeError("读取 MiniMind 数据集需要 datasets，请先安装主仓库 requirements.txt 中的依赖。") from exc
-    return load_dataset("json", data_files=path, split="train")
+    kwargs = {"data_files": path, "split": "train"}
+    if features is not None:
+        kwargs["features"] = features
+    return load_dataset("json", **kwargs)
+
+
+def _conversation_features():
+    """显式声明 MiniMind SFT 对话字段，兼容 tool-call 样本的可选字段。"""
+    from datasets import Features, Value
+
+    return Features(
+        {
+            "conversations": [
+                {
+                    "role": Value("string"),
+                    "content": Value("string"),
+                    "reasoning_content": Value("string"),
+                    "tools": Value("string"),
+                    "tool_calls": Value("string"),
+                }
+            ]
+        }
+    )
 
 
 def _input_ids(encoded: Any) -> list[int]:
@@ -103,7 +125,7 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.augment = augment
-        self.samples = _load_json_dataset(data_path)
+        self.samples = _load_json_dataset(data_path, features=_conversation_features())
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.bos_id = _input_ids(tokenizer(f"{tokenizer.bos_token}assistant\n", add_special_tokens=False))
         self.eos_id = _input_ids(tokenizer(f"{tokenizer.eos_token}\n", add_special_tokens=False))
