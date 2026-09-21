@@ -68,7 +68,7 @@ class FakeScaler:
 
 
 class TrainingStabilityTest(unittest.TestCase):
-    def test_sft_training_rejects_batch_without_targets(self):
+    def test_sft_training_skips_batch_without_targets(self):
         config = MiniMindConfig(
             vocab_size=8,
             hidden_size=4,
@@ -80,23 +80,23 @@ class TrainingStabilityTest(unittest.TestCase):
         dataloader = DataLoader(EmptyTargetDataset(), batch_size=1, num_workers=0)
 
         with tempfile.TemporaryDirectory() as output_dir:
-            with self.assertRaises(ValueError):
-                train_model(
-                    model=NaNLossModel(),
-                    dataloader=dataloader,
-                    config=config,
-                    device=torch.device("cpu"),
-                    dtype=torch.float32,
-                    output_dir=output_dir,
-                    stage="sft",
-                    epochs=1,
-                    learning_rate=1e-3,
-                    accumulation_steps=1,
-                    grad_clip=1.0,
-                    save_interval=0,
-                    max_steps=1,
-                    require_targets=True,
-                )
+            train_model(
+                model=NaNLossModel(),
+                dataloader=dataloader,
+                config=config,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                output_dir=output_dir,
+                stage="sft",
+                epochs=1,
+                learning_rate=1e-3,
+                accumulation_steps=1,
+                grad_clip=1.0,
+                save_interval=0,
+                max_steps=1,
+                require_targets=True,
+            )
+            self.assertTrue(Path(output_dir, "sft_last.pt").exists())
 
     def test_init_weights_are_loaded_from_cpu(self):
         source = nn.Linear(2, 2)

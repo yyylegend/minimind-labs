@@ -259,6 +259,7 @@ def evaluate_model(model, dataloader, device: torch.device, dtype: torch.dtype, 
     model.eval()
     loss_sum = 0.0
     target_tokens = 0
+    dropped_samples = 0
     try:
         for batch in dataloader:
             input_ids = batch["input_ids"]
@@ -266,8 +267,13 @@ def evaluate_model(model, dataloader, device: torch.device, dtype: torch.dtype, 
             attention_mask = batch["attention_mask"]
             target_counts = labels[..., 1:].ne(-100).sum(dim=-1)
             if require_targets and (target_counts == 0).any().item():
-                bad_rows = (target_counts == 0).nonzero(as_tuple=False).flatten().tolist()
-                raise ValueError(f"验证集存在没有有效 assistant target 的样本：rows={bad_rows}")
+                valid_rows = target_counts > 0
+                dropped_samples += int((~valid_rows).sum().item())
+                if not valid_rows.any().item():
+                    continue
+                input_ids = input_ids[valid_rows]
+                labels = labels[valid_rows]
+                attention_mask = attention_mask[valid_rows]
 
             batch_targets = int(target_counts.sum().item())
             if batch_targets == 0:
@@ -289,7 +295,7 @@ def evaluate_model(model, dataloader, device: torch.device, dtype: torch.dtype, 
 
     if target_tokens == 0:
         raise ValueError("验证集没有任何有效 target token")
-    return loss_sum / target_tokens, target_tokens
+    return loss_sum / target_tokens, target_tokens, dropped_samples
 
 
 def train_model(
@@ -345,6 +351,7 @@ def train_model(
     current_epoch = start_epoch
     last_update_batch = resume_batch
     consecutive_fp16_overflows = 0
+    invalid_target_samples = 0
 
     try:
         for epoch in range(start_epoch, epochs):
@@ -367,10 +374,19 @@ def train_model(
                 if require_targets:
                     target_counts = labels[..., 1:].ne(-100).sum(dim=-1)
                     if (target_counts == 0).any().item():
-                        bad_rows = (target_counts == 0).nonzero(as_tuple=False).flatten().tolist()
-                        raise ValueError(
-                            f"SFT batch 中存在没有有效 assistant target 的样本：rows={bad_rows}"
-                        )
+                        valid_rows = target_counts > 0
+                        dropped = int((~valid_rows).sum().item())
+                        invalid_target_samples += dropped
+                        if invalid_target_samples <= 5:
+                            print(
+                                f"SFT 跳过无 assistant target 的样本：本 batch 丢弃 {dropped} 条，"
+                                f"累计 {invalid_target_samples} 条。"
+                            )
+                        if not valid_rows.any().item():
+                            continue
+                        input_ids = input_ids[valid_rows]
+                        labels = labels[valid_rows]
+                        attention_mask = attention_mask[valid_rows]
                 metrics.record_batch(input_ids, attention_mask, labels)
                 input_ids = input_ids.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
@@ -498,7 +514,7 @@ def train_model(
                         f"正在验证：step={global_step}/{total_steps}，"
                         f"验证 batch={len(eval_dataloader)}，请等待..."
                     )
-                    eval_loss, eval_target_tokens = evaluate_model(
+                    eval_loss, eval_target_tokens, eval_dropped_samples = evaluate_model(
                         model,
                         eval_dataloader,
                         device,
@@ -508,9 +524,11 @@ def train_model(
                     if writer is not None:
                         writer.add_scalar("eval/loss", eval_loss, global_step)
                         writer.add_scalar("eval/target_tokens", eval_target_tokens, global_step)
+                        writer.add_scalar("eval/invalid_target_samples", eval_dropped_samples, global_step)
                     print(
                         f"eval step={global_step} loss={eval_loss:.4f} "
                         f"target_tokens={eval_target_tokens} "
+                        f"dropped={eval_dropped_samples} "
                         f"耗时={time.perf_counter() - eval_started_at:.1f}s"
                     )
                     if eval_loss < best_eval_loss:
