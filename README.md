@@ -273,6 +273,29 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
 
 SFT 默认固定划分 2% 数据作为验证集，只对 assistant target token 计算验证 loss。没有留下有效 assistant target 的截断样本会被跳过并计数，不会参与训练。验证 loss 创新低时会额外保存 `full_sft_best_<hidden_size>.pth`；`full_sft_<hidden_size>.pth` 仍表示最近一次保存的模型。
 
+### 原始 SFT 与专项 SFT 对照评测
+
+`scripts/eval_sft_comparison.py` 使用同一组贪心解码设置比较两个 checkpoint：8 条固定通用问题并排展示、未参与专项训练的 OrcaMath 数值题 exact match、以及未参与专项训练的代码题测试通过率。代码和数学样本会按训练 JSONL 中的 user prompt 去重；完整结果保存为 JSON，通用回答用于人工检查。
+
+代码通过率需要 Linux 上可用的 [Bubblewrap](https://github.com/containers/bubblewrap) 隔离环境。服务器以 root 运行时可安装：
+
+```bash
+apt-get update && apt-get install -y bubblewrap
+```
+
+```bash
+python scripts/eval_sft_comparison.py \
+  --base_checkpoint out/checkpoints/sft_768/full_sft_best_768.pth \
+  --candidate_checkpoint out/checkpoints/sft_code_math_replay10k/full_sft_best_768.pth \
+  --train_data data/sft_t2t_mini.jsonl data/sft_code_math_mix_replay10k.jsonl \
+  --code_dir data/raw/code/data \
+  --math_dir data/raw/math/data \
+  --tokenizer_path ../minimind/model \
+  --output out/evaluations/sft_code_math_comparison.json
+```
+
+代码样本在 Bubblewrap 新建的用户、进程和网络命名空间内运行，系统目录只读，仅临时工作目录可写；子进程还受 CPU 时间、内存和输出大小限制。若运行环境不允许创建隔离命名空间，可加 `--skip_code_execution`，此时仍会比较通用回答和数学准确率，但不统计代码通过率。数学 exact match 只对答案中可抽取的数值做精确比较；通用回答需人工检查。
+
 ## 暂停、恢复和监控
 
 训练循环会周期性保存 checkpoint。运行中按 `Ctrl+C` 会先保存当前安全状态；也可以使用 `--save_interval` 定期保存。
