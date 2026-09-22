@@ -10,6 +10,7 @@ checkpoints/
 out/
 outputs/
 data/*.jsonl
+data/raw/
 *.pt
 *.pth
 *.safetensors
