@@ -87,6 +87,25 @@ def _math_conversations(row: dict[str, Any]) -> list[dict[str, str]] | None:
     return [_message("user", question), _message("assistant", answer)]
 
 
+def _render_chat_prompt(tokenizer, conversations: list[dict[str, str]]) -> str:
+    """Render prompts with the same tool-field decoding used by SFTDataset."""
+    messages = []
+    tools = None
+    for raw_message in conversations:
+        message = dict(raw_message)
+        if message.get("role") == "system" and message.get("tools"):
+            tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+        if message.get("tool_calls") and isinstance(message["tool_calls"], str):
+            message["tool_calls"] = json.loads(message["tool_calls"])
+        messages.append(message)
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=tools,
+    )
+
+
 def _iter_parquet_rows(directory: Path) -> Iterable[dict[str, Any]]:
     try:
         import pyarrow.parquet as parquet
@@ -133,14 +152,7 @@ def _reservoir_sample(
         nonlocal eligible
         if not batch:
             return
-        rendered = [
-            tokenizer.apply_chat_template(
-                conversations,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-            for conversations in batch
-        ]
+        rendered = [_render_chat_prompt(tokenizer, conversations) for conversations in batch]
         tokenized = tokenizer(rendered, add_special_tokens=False, truncation=False)
         for conversations, token_ids in zip(batch, tokenized["input_ids"]):
             if len(token_ids) > max_seq_len:
