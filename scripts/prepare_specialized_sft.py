@@ -118,6 +118,7 @@ def _reservoir_sample(
     tokenizer,
     max_seq_len: int,
     seed: int,
+    source_name: str,
     batch_size: int = 256,
 ) -> tuple[list[list[dict[str, str]]], int, int]:
     """Sample eligible examples uniformly without holding the source dataset in RAM."""
@@ -125,6 +126,7 @@ def _reservoir_sample(
     reservoir: list[list[dict[str, str]]] = []
     scanned = 0
     eligible = 0
+    next_progress = 10000
     pending: list[list[dict[str, str]]] = []
 
     def consume_batch(batch: list[list[dict[str, str]]]) -> None:
@@ -160,6 +162,11 @@ def _reservoir_sample(
         if len(pending) == batch_size:
             consume_batch(pending)
             pending = []
+        if scanned >= next_progress:
+            consume_batch(pending)
+            pending = []
+            print(f"{source_name}: scanned={scanned}, eligible={eligible}", flush=True)
+            next_progress += 10000
     consume_batch(pending)
     return reservoir, scanned, eligible
 
@@ -223,6 +230,7 @@ def main() -> None:
             tokenizer,
             args.max_seq_len,
             seed,
+            name,
         )
         print(
             f"{name}: scanned={scanned}, under_{args.max_seq_len}_tokens={eligible}, "
