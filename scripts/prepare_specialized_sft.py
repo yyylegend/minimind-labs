@@ -177,7 +177,7 @@ def main() -> None:
     parser.add_argument("--math_dir", type=Path, default=Path("data/raw/math/data"))
     parser.add_argument("--general_data", type=Path, default=Path("data/sft_t2t_mini.jsonl"))
     parser.add_argument("--tokenizer_path", type=str, default="../minimind/model")
-    parser.add_argument("--output", type=Path, default=Path("data/sft_code_math_20k.jsonl"))
+    parser.add_argument("--output", type=Path, default=Path("data/sft_code_math_mix.jsonl"))
     parser.add_argument("--code_samples", type=int, default=5000)
     parser.add_argument("--math_samples", type=int, default=10000)
     parser.add_argument("--general_samples", type=int, default=5000)
