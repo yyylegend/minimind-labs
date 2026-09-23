@@ -190,3 +190,77 @@ class SFTDataset(Dataset):
                 dtype=torch.long,
             ),
         }
+
+
+class DPODataset(Dataset):
+    """读取 chosen/rejected 对话，只对最后一条 assistant 回复计算偏好。"""
+
+    def __init__(self, data_path: str, tokenizer, max_length: int = 768) -> None:
+        super().__init__()
+        if max_length < 2:
+            raise ValueError("DPO max_length 必须至少为 2")
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        self.samples = _load_json_dataset(data_path)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _encode_conversation(self, messages: list[dict[str, Any]]) -> tuple[torch.Tensor, ...]:
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages[:-1], tokenize=False, add_generation_prompt=True
+        )
+        conversation_text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        prompt_ids = _input_ids(self.tokenizer(prompt_text, add_special_tokens=False))
+        input_ids = _input_ids(self.tokenizer(conversation_text, add_special_tokens=False))
+
+        # 用 prompt 和完整对话的最长共同 token 前缀定位回复起点，避免把问题算进偏好分数。
+        shared_length = 0
+        for prompt_id, token_id in zip(prompt_ids, input_ids):
+            if prompt_id != token_id:
+                break
+            shared_length += 1
+        if shared_length == 0 or shared_length == len(input_ids):
+            raise ValueError("DPO 样本无法定位 assistant 回复，请检查 tokenizer chat template")
+
+        prompt_ids = input_ids[:shared_length]
+        response_ids = input_ids[shared_length:]
+        response_length = min(len(response_ids), self.max_length)
+        prompt_length = min(len(prompt_ids), self.max_length - response_length)
+        retained_prompt = prompt_ids[-prompt_length:] if prompt_length else []
+        retained_response = response_ids[:response_length]
+        retained_ids = retained_prompt + retained_response
+        response_mask = [0] * len(retained_prompt) + [1] * len(retained_response)
+        valid_length = len(retained_ids)
+        padding_length = self.max_length - valid_length
+
+        return (
+            torch.tensor(retained_ids + [self.pad_token_id] * padding_length, dtype=torch.long),
+            torch.tensor([1] * valid_length + [0] * padding_length, dtype=torch.long),
+            torch.tensor(response_mask + [0] * padding_length, dtype=torch.long),
+        )
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        sample = self.samples[index]
+        chosen = sample.get("chosen")
+        rejected = sample.get("rejected")
+        if not isinstance(chosen, list) or not isinstance(rejected, list) or not chosen or not rejected:
+            raise ValueError(f"DPO 样本 {index} 必须包含非空 chosen/rejected 对话")
+        if chosen[:-1] != rejected[:-1]:
+            raise ValueError(f"DPO 样本 {index} 的 chosen/rejected 必须共享相同对话上下文")
+        if chosen[-1].get("role") != "assistant" or rejected[-1].get("role") != "assistant":
+            raise ValueError(f"DPO 样本 {index} 的最后一条消息必须来自 assistant")
+
+        chosen_ids, chosen_attention, chosen_response = self._encode_conversation(chosen)
+        rejected_ids, rejected_attention, rejected_response = self._encode_conversation(rejected)
+        return {
+            "chosen_input_ids": chosen_ids,
+            "chosen_attention_mask": chosen_attention,
+            "chosen_response_mask": chosen_response,
+            "rejected_input_ids": rejected_ids,
+            "rejected_attention_mask": rejected_attention,
+            "rejected_response_mask": rejected_response,
+        }

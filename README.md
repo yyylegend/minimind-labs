@@ -19,7 +19,7 @@ TransformerBlock
   ↓
 Causal Language Model
   ↓
-Pretrain → SFT → 评测 / 部署
+Pretrain → SFT → DPO（可选） → 固定评测 / 部署
 ```
 
 ## 项目特点
@@ -28,6 +28,7 @@ Pretrain → SFT → 评测 / 部署
 - 保留手写 Attention，便于理解 Q/K/V、RoPE、GQA 和 KV Cache
 - 支持 PyTorch 融合 Attention 路径，用于实际训练
 - 支持 next-token prediction、预训练和监督微调
+- 支持使用 chosen/rejected 偏好对进行 DPO 训练
 - 使用 MiniMind 风格的权重初始化，控制初始 logits 的数值尺度
 - 支持断点恢复、训练进度、速度和预计剩余时间
 - 支持 TensorBoard 观察 loss、学习率、吞吐量和显存
@@ -43,7 +44,7 @@ minimind-labs/
 ├── data/                         # 本地数据集，不提交到 Git
 ├── dataset/
 │   ├── __init__.py
-│   └── lm_dataset.py             # JSONL 读取、tokenize、labels 构造
+│   └── lm_dataset.py             # JSONL 读取、tokenize、训练目标构造
 ├── minimind_lab/
 │   ├── __init__.py
 │   ├── config.py                  # 模型配置
@@ -58,7 +59,9 @@ minimind-labs/
 │   ├── metrics.py                # 滚动吞吐、ETA、padding 与稳定性指标
 │   ├── trainer_utils.py           # 设备、精度、checkpoint、训练循环
 │   ├── train_pretrain.py          # 预训练入口
-│   └── train_sft.py               # SFT 入口
+│   ├── train_sft.py               # SFT 入口
+│   ├── dpo_utils.py               # DPO 偏好损失
+│   └── train_dpo.py               # DPO 入口
 ├── scripts/
 │   ├── demo_*.py                  # 单模块演示
 │   └── export_official_weights.py # 旧 checkpoint 导出工具
@@ -140,6 +143,8 @@ SFT 数据由数据集读取器按照对话格式构造输入，并只对需要�
 预训练：学习语言和代码的基本分布
     ↓
 SFT：学习问答格式、指令遵循和任务行为
+    ↓
+DPO（可选）：用 chosen/rejected 回答偏好继续对齐
     ↓
 固定评测集：比较训练前后的能力变化
 ```
@@ -272,6 +277,46 @@ CPU 环境请将 `--device cpu` 和 `--dtype float32` 一起使用。
 模型结构参数需要和预训练阶段保持一致。预训练和 SFT 都可以先使用 `max_seq_len=768`；如果 SFT 样本明显更长，再单独提高 SFT 的序列长度，并重新测量吞吐量和显存。实际训练时还应根据数据规模和评测结果调整学习率与训练轮数。
 
 SFT 默认固定划分 2% 数据作为验证集，只对 assistant target token 计算验证 loss。没有留下有效 assistant target 的截断样本会被跳过并计数，不会参与训练。验证 loss 创新低时会额外保存 `full_sft_best_<hidden_size>.pth`；`full_sft_<hidden_size>.pth` 仍表示最近一次保存的模型。
+
+### 4. DPO 偏好对齐（可选）
+
+DPO 用同一个问题下的较好回答（`chosen`）和较差回答（`rejected`）训练策略模型，同时冻结一份初始 SFT 模型作为 reference。训练只计算回答部分的 token 概率，不把用户问题计入偏好分数。
+
+MiniMind 官方提供的 `dpo.jsonl` 采用 `chosen` / `rejected` 对话列表格式，数据抽样自 [DPO-En-Zh-20k](https://huggingface.co/datasets/llamafactory/DPO-En-Zh-20k)。它适合练习通用偏好对齐，不等同于有单元测试或数学判题器的正确性奖励，因此不能预期 DPO 自动提升代码 pass@1 或数学正确率。[MiniMind 数据说明](https://github.com/jingyaogong/minimind/blob/master/README.md?plain=1)
+
+在训练服务器的项目根目录下载数据：
+
+```bash
+python -m pip install -U huggingface_hub
+hf download jingyaogong/minimind_dataset dpo.jsonl --repo-type dataset --local-dir data
+```
+
+先跑两个 step 验证数据、模型和 checkpoint 链路：
+
+```bash
+python -m trainer.train_dpo \
+  --data_path data/dpo.jsonl \
+  --tokenizer_path ../minimind/model \
+  --init_checkpoint out/checkpoints/sft_code_math_replay10k/full_sft_best_768.pth \
+  --output_dir out/smoke/dpo \
+  --tensorboard_dir out/runs/dpo_smoke \
+  --device cuda:0 --dtype bfloat16 \
+  --max_steps 2
+```
+
+Smoke test 通过后，将输出目录改为正式目录并移除 `--max_steps 2`：
+
+```bash
+python -m trainer.train_dpo \
+  --data_path data/dpo.jsonl \
+  --tokenizer_path ../minimind/model \
+  --init_checkpoint out/checkpoints/sft_code_math_replay10k/full_sft_best_768.pth \
+  --output_dir out/checkpoints/dpo \
+  --tensorboard_dir out/runs/dpo \
+  --device cuda:0 --dtype bfloat16
+```
+
+默认结构参数为 `hidden_size=768`、8 层、8 个 Q heads、4 个 KV heads、`max_seq_len=768`；每批 2 组偏好对，训练 1 轮，学习率 `4e-8`，`beta=0.15`。使用 2080 Ti 时把精度改成 `--dtype float16`。程序会保存 `dpo_last.pt`（可恢复训练）和 `dpo_768.pth`（纯模型权重）；恢复时传入 `--resume_checkpoint out/checkpoints/dpo/dpo_last.pt`，并保持原来的 `--init_checkpoint` 不变。
 
 ### 原始 SFT 与专项 SFT 对照评测
 
