@@ -1,10 +1,8 @@
 # MiniMind Labs
 
-一个用于学习和复现小型 Decoder-only Transformer 的独立实验项目。
+这是一个从 Transformer 模块开始，亲手组装、训练、评测并部署小语言模型的实验项目。
 
-本项目明确参考 [MiniMind](https://github.com/jingyaogong/minimind) 的模型结构、配置方式、训练流程和权重格式。它是面向学习的独立实现，不是 MiniMind 官方仓库或官方发布版本；代码、实验和训练输出均放在本仓库中维护，原始 MiniMind 仓库仅作为只读对照。
-
-项目的目标是把一个语言模型拆成可以单独理解、测试和组装的模块，并最终跑通：
+模型结构和训练流程参考 [MiniMind](https://github.com/jingyaogong/minimind)，但本仓库是独立的教学实现，不是官方 MiniMind。MiniMind 原仓库只作只读对照，训练代码、数据准备脚本和实验记录维护在这里。
 
 ```text
 RMSNorm
@@ -19,7 +17,7 @@ TransformerBlock
   ↓
 Causal Language Model
   ↓
-Pretrain → SFT → DPO（可选） → 固定评测 / 部署
+Pretrain → 通用 SFT → 代码/数学专项 SFT → DPO → 评测与 API 部署
 ```
 
 ## 项目特点
@@ -64,7 +62,9 @@ minimind-labs/
 │   └── train_dpo.py               # DPO 入口
 ├── scripts/
 │   ├── demo_*.py                  # 单模块演示
-│   └── export_official_weights.py # 旧 checkpoint 导出工具
+│   ├── prepare_specialized_sft.py # 混合代码、数学和通用 SFT 数据
+│   ├── eval_sft_comparison.py     # 两个 checkpoint 的固定集对照
+│   └── export_official_weights.py # 旧训练 checkpoint 导出工具
 └── tests/                         # 核心模块的最小测试
 ```
 
@@ -109,47 +109,67 @@ $trainPy = (Resolve-Path .\.venv-train\Scripts\python.exe).Path
 & $trainPy -m scripts.demo_causal_lm
 ```
 
-## 数据和参考 Tokenizer
+## 数据集与来源
 
-训练入口需要一个 MiniMind 风格的 tokenizer，以及对应格式的 JSONL 数据。参考 MiniMind 的 tokenizer 通常位于其仓库的 `model/` 目录。
+数据文件放在 `data/`，不会提交到 Git。预训练、SFT 和 DPO 的数据来自 MiniMind 官方数据仓库；代码、数学专项数据由本项目脚本转换成 SFT 格式。
 
-```text
-<minimind-repo>/model
+| 文件 | 来源 | 在流程中的用途 |
+|---|---|---|
+| `data/pretrain_t2t_mini.jsonl` | MiniMind 官方轻量预训练集。官方说明其为清洗、去重后的混合文本，来源包括匠数大模型数据集、Magpie-Align 等；没有公开逐条来源比例。 | Pretrain，学习文本分布和续写。 |
+| `data/sft_t2t_mini.jsonl` | MiniMind 官方轻量 SFT 集，混合公开指令/对话与合成蒸馏数据，含部分 Tool Call。官方列出的来源包括匠数、Magpie-Align、R1-Distill-SFT、COIG、Step-3.5-Flash-SFT 等。 | 通用 SFT，也作为专项 SFT 的通用回放数据。 |
+| `data/raw/code/data/*.parquet` | [`open-r1/verifiable-coding-problems-python_decontaminated-tested-shuffled`](https://huggingface.co/datasets/open-r1/verifiable-coding-problems-python_decontaminated-tested-shuffled)，15,068 条通过参考测试的 Python 题；source 标签包括 TACO、CodeContests、APPS。 | 代码专项 SFT 候选数据及代码评测题源。 |
+| `data/raw/math/data/*.parquet` | 下载自 [`minhdang/math`](https://huggingface.co/datasets/minhdang/math)，200,035 条 question/answer。样例与 [Microsoft Orca-Math-200k](https://huggingface.co/datasets/microsoft/orca-math-word-problems-200k) 相同，但 `minhdang/math` 数据卡没有写明上游来源，因此这里按实际下载仓库署名。 | 数学专项 SFT 候选数据及数学评测题源。 |
+| `data/sft_code_math_mix_replay10k.jsonl` | 本地运行 `scripts/prepare_specialized_sft.py`，由代码题、数学题和 10,000 条通用 SFT 回放样本混合生成；当前文件 24,569 行，长样本会按 768 token 限制筛除。 | 专项 SFT。 |
+| `data/dpo.jsonl` | MiniMind 官方打包的偏好数据，抽样自 [`DPO-En-Zh-20k`](https://huggingface.co/datasets/llamafactory/DPO-En-Zh-20k)，包含 `chosen` / `rejected` 回答对。 | DPO 偏好对齐，不是代码或数学正确性奖励。 |
+
+MiniMind tokenizer 使用原仓库 `model/` 目录。预训练 JSONL 每行形如 `{"text":"..."}`；SFT 文件使用 `conversations` 多轮消息。SFT loss 只计算 assistant 回答部分。
+
+专项 SFT 数据可从已下载的 parquet 文件重新生成：
+
+```bash
+python scripts/prepare_specialized_sft.py \
+  --code_dir data/raw/code/data \
+  --math_dir data/raw/math/data \
+  --general_data data/sft_t2t_mini.jsonl \
+  --output data/sft_code_math_mix_replay10k.jsonl \
+  --code_samples 5000 --math_samples 10000 --general_samples 10000 \
+  --max_seq_len 768 --tokenizer_path ../minimind/model
 ```
 
-下载的数据放在本项目的 `data/` 目录，例如：
-
-```text
-data/
-├── pretrain_t2t_mini.jsonl
-└── sft_t2t_mini.jsonl
-```
-
-数据集和训练产物已加入 `.gitignore`，不会随代码提交。也可以把 `--tokenizer_path` 改成自己准备的 tokenizer 目录，把 `--data_path` 改成自己的 JSONL 文件。
-
-预训练数据使用类似下面的格式：
-
-```json
-{"text": "机器学习模型通过数据学习规律。"}
-```
-
-SFT 数据由数据集读取器按照对话格式构造输入，并只对需要学习的回答部分计算 loss。
+MiniMind 数据卡：[预训练与 SFT 来源](https://huggingface.co/datasets/jingyaogong/minimind_dataset)。该仓库提供的是整理后的混合数据，无法从文件名还原每条样本的原始出处。
 
 ## 训练流程
 
-训练分为两个阶段：
+训练的完整路径是：
 
 ```text
-预训练：学习语言和代码的基本分布
+Pretrain：学习通用文本的续写分布
     ↓
-SFT：学习问答格式、指令遵循和任务行为
+SFT：学习指令跟随与对话格式
     ↓
-DPO（可选）：用 chosen/rejected 回答偏好继续对齐
+专项 SFT：混入代码、数学题和通用回放数据
     ↓
-固定评测集：比较训练前后的能力变化
+DPO：用 chosen/rejected 偏好对继续训练
+    ↓
+评测与 API 推理：检查训练前后变化并加载模型
 ```
 
+### 本次实际训练
+
+这次跑的是 63.91M 参数模型：`hidden_size=768`、8 层、8 个 Q heads、4 个 KV heads，训练序列长度 768。实际顺序和权重如下：
+
+| 阶段 | 初始化与数据 | 训练后权重 |
+|---|---|---|
+| Pretrain | 随机初始化，使用 `pretrain_t2t_mini.jsonl`，1 epoch | `out/checkpoints/pretrain_768/pretrain_768.pth` |
+| 通用 SFT | 从 Pretrain 权重开始，使用 `sft_t2t_mini.jsonl`，1 epoch | `out/checkpoints/sft_768/full_sft_best_768.pth` |
+| 专项 SFT | 从通用 SFT 开始，使用 `sft_code_math_mix_replay10k.jsonl`，1 epoch | `out/checkpoints/sft_code_math_replay10k/full_sft_best_768.pth` |
+| DPO | 从专项 SFT 开始，使用 `dpo.jsonl`，1 epoch，`beta=0.15`，学习率 `4e-8` | `out/checkpoints/dpo/dpo_768.pth` |
+
+下面的 512 hidden-size 命令是较省显存的通用示例，不是这次 768 模型的实际训练配置。复现本次实验时，结构参数要保持 768/8 层/8 Q heads/4 KV heads。
+
 ### 参数选择：通用单卡基线
+
+上面的 768 配置是本次实际训练使用的模型结构。下面的 512 命令是显存更省的通用示例，两者不要混为同一次实验。
 
 本项目默认使用 MiniMind 的 `pretrain_t2t_mini.jsonl` 和 `sft_t2t_mini.jsonl`。MiniMind 官方对这两份 mini 数据都建议将 `max_seq_len` 设置在约 `768` tokens，并提醒过短会截断语义、过长会增加 padding 和计算浪费。[官方数据说明](https://github.com/jingyaogong/minimind/blob/master/README.md?plain=1#L2879-L2903)
 
@@ -287,9 +307,11 @@ MiniMind 官方提供的 `dpo.jsonl` 采用 `chosen` / `rejected` 对话列表�
 在训练服务器的项目根目录下载数据：
 
 ```bash
-python -m pip install -U huggingface_hub
+python -m pip install 'huggingface-hub>=0.34.0,<1.0'
 hf download jingyaogong/minimind_dataset dpo.jsonl --repo-type dataset --local-dir data
 ```
+
+这里给 Hub 客户端加了版本上限：当前训练依赖使用 Transformers 4.x，Hub 1.x 会导致导入版本冲突。数据下载完成后不用再次升级 `huggingface-hub`。
 
 先跑两个 step 验证数据、模型和 checkpoint 链路：
 
@@ -318,32 +340,60 @@ python -m trainer.train_dpo \
 
 默认结构参数为 `hidden_size=768`、8 层、8 个 Q heads、4 个 KV heads、`max_seq_len=768`；每批 2 组偏好对，训练 1 轮，学习率 `4e-8`，`beta=0.15`。使用 2080 Ti 时把精度改成 `--dtype float16`。程序会保存 `dpo_last.pt`（可恢复训练）和 `dpo_768.pth`（纯模型权重）；恢复时传入 `--resume_checkpoint out/checkpoints/dpo/dpo_last.pt`，并保持原来的 `--init_checkpoint` 不变。
 
-### 原始 SFT 与专项 SFT 对照评测
+### 评测方法与实际结果
 
-`scripts/eval_sft_comparison.py` 使用同一组贪心解码设置比较两个 checkpoint：8 条固定通用问题并排展示、未参与专项训练的 OrcaMath 数值题 exact match、以及未参与专项训练的代码题测试通过率。代码和数学样本会按训练 JSONL 中的 user prompt 去重；完整结果保存为 JSON，通用回答用于人工检查。
+`scripts/eval_sft_comparison.py` 用固定解码设置对比两个权重：8 条通用问题供人工检查、50 道数学题按最终数值做 Exact Match、50 道代码题计算 Pass@1。数学分数只看抽取到的最终数字，不评判推理过程；50 题里答对/答错一题，就会变化 2 个百分点。
 
-代码通过率需要 Linux 上可用的 [Bubblewrap](https://github.com/containers/bubblewrap) 隔离环境。服务器以 root 运行时可安装：
+| 对比 | 数学 Exact Match | 代码 Pass@1 | 环境与备注 |
+|---|---:|---|---|
+| 官方 MiniMind 64M SFT vs 本项目通用 SFT | 2% vs 2%（各 1/50） | 跳过 | CPod，BF16 |
+| 本项目专项 SFT vs DPO | 2% vs 2%（各 1/50） | 跳过 | CPod，BF16；这轮没有测出 DPO 数学提升 |
+| 通用 SFT vs 专项 SFT | 2% vs 4%（1/50 vs 2/50） | 跳过 | 本地 2080 Ti，FP16；另一次 CPod BF16 对比为 2% vs 2%，结果不一致，不能据此宣称稳定提升 |
 
-```bash
-apt-get update && apt-get install -y bubblewrap
-```
+代码执行没有完成：CPod 的内核不允许 Bubblewrap 创建所需的隔离命名空间。因此报告里的代码样本只是生成结果，`code_pass_at_1` 状态为 `skipped`，不是 0 分。不要把未经沙箱验证的生成代码直接运行。
+
+评测会按训练 JSONL 里的 `conversations` user prompt 去重；目前不解析 DPO 文件的 `chosen/rejected` 对话，所以 DPO 评测还没有排除 DPO 样本本身的 prompt。完整并排回答和指标保存在 `out/evaluations/*.json`；8 条通用回答需要人工检查，不作为量化分数。
+
+例如，比较 DPO 前后的专项 SFT：
 
 ```bash
 python scripts/eval_sft_comparison.py \
-  --base_checkpoint out/checkpoints/sft_768/full_sft_best_768.pth \
-  --candidate_checkpoint out/checkpoints/sft_code_math_replay10k/full_sft_best_768.pth \
+  --base_checkpoint out/checkpoints/sft_code_math_replay10k/full_sft_best_768.pth \
+  --candidate_checkpoint out/checkpoints/dpo/dpo_768.pth \
   --train_data data/sft_t2t_mini.jsonl data/sft_code_math_mix_replay10k.jsonl \
   --code_dir data/raw/code/data \
   --math_dir data/raw/math/data \
   --tokenizer_path ../minimind/model \
-  --output out/evaluations/sft_code_math_comparison.json
+  --output out/evaluations/sft_vs_dpo.json \
+  --skip_code_execution
 ```
 
-代码样本在 Bubblewrap 新建的用户、进程和网络命名空间内运行，系统目录只读，仅临时工作目录可写；子进程还受 CPU 时间、内存和输出大小限制。若运行环境不允许创建隔离命名空间，可加 `--skip_code_execution`，此时仍会比较通用回答和数学准确率，但不统计代码通过率。数学 exact match 只对答案中可抽取的数值做精确比较；通用回答需人工检查。
+要统计代码 Pass@1，需在允许创建 Bubblewrap 用户/进程/网络命名空间的 Linux 环境运行；单纯安装 Bubblewrap 不一定能解除容器内核的限制。
+
+### API 推理
+
+`dpo_768.pth` 已经是 MiniMind 原生 PyTorch `state_dict`，不必为了官方 MiniMind API 再转成 safetensors 或 Transformers 目录。用原仓库的 `scripts/serve_openai_api.py` 加载即可；这条路径已用 `eval_llm.py` 严格加载并成功生成。API 能返回内容不代表回答质量可靠，当前小模型仍会重复或编造信息。
+
+在两个仓库并排放置的 Linux 服务器上，从 MiniMind 原仓库的 `scripts/` 目录启动：
+
+```bash
+cd ../minimind/scripts
+# 若环境缺少服务依赖，先安装：python -m pip install fastapi uvicorn
+python serve_openai_api.py \
+  --load_from ../model \
+  --save_dir ../minimind-labs/out/checkpoints/dpo \
+  --weight dpo \
+  --hidden_size 768 --num_hidden_layers 8 --max_seq_len 768 \
+  --device cuda:0
+```
+
+官方加载器会把 `--weight dpo` 和 `hidden_size=768` 拼成 `dpo_768.pth`。服务监听 `8998` 端口，提供 `/v1/chat/completions`。这个示例服务没有认证，不要直接暴露到公网；仅在本机或受控的内网端口转发中使用。
+
+Windows 本地 `.venv-train` 若由 `uv` 创建，可能没有 `pip`。可用 `uv pip install --python .\.venv-train\Scripts\python.exe fastapi uvicorn` 安装服务依赖，再在 MiniMind 的 `scripts` 目录用同一组参数启动；`--save_dir` 要指向旁边 `minimind-labs/out/checkpoints/dpo`。
 
 ## 暂停、恢复和监控
 
-训练循环会周期性保存 checkpoint。运行中按 `Ctrl+C` 会先保存当前安全状态；也可以使用 `--save_interval` 定期保存。
+Pretrain 和 SFT 收到 `Ctrl+C` 时会保存最近一次完整 optimizer 更新后的安全状态。DPO 则按 `--save_interval` 定期保存，并在 epoch 结束时保存；中断后从最近的 `dpo_last.pt` 恢复，可能需要重跑最后一次保存后的少量 step。
 
 恢复训练时尽量保持模型结构、`max_seq_len`、`batch_size`、`accumulation_steps` 和学习率调度参数不变。如果要比较另一组训练参数，建议使用新的 `output_dir`，避免把不同实验混在同一个可恢复 checkpoint 中。训练发现非有限 loss 时会主动停止，并拒绝用坏权重覆盖已有 checkpoint；FP16 的单次梯度溢出则由 GradScaler 自动跳过并降低 scale，连续多次无法恢复才会停止。
 
@@ -412,7 +462,7 @@ train/grad_norm、stability/grad_scaler_scale、stability/fp16_overflow_total
 ├── 包含模型、优化器、Scaler 和训练进度
 └── 适合继续跑实验
 
-pretrain_<hidden_size>.pth / full_sft_<hidden_size>.pth
+pretrain_<hidden_size>.pth / full_sft_<hidden_size>.pth / dpo_<hidden_size>.pth
 ├── 纯模型权重
 ├── MiniMind 风格的 state_dict
 └── 可用于后续评测、加载或部署
@@ -428,18 +478,15 @@ pretrain_<hidden_size>.pth / full_sft_<hidden_size>.pth
 
 只有模型结构、词表和 tokenizer 配置一致时，权重才可以直接交给 MiniMind 的评测或部署脚本使用。
 
-## 后续方向
+## 下一步计划
 
-基础训练链路稳定后，再逐步加入：
+当前已经跑通 Pretrain → 通用 SFT → 代码/数学专项 SFT → DPO，并用 MiniMind 官方 API 加载 DPO 权重。下一步先补可靠评测，不急着加模型结构：
 
-- LoRA / QLoRA
-- DPO 或 GRPO
-- 代码和数学专项数据、固定评测集
-- MoE
-- DDP 和更高效的数据管线
-- 多模态输入与图像生成方向
+1. 让评测脚本也从 DPO 的 `chosen/rejected` 样本中过滤重合题目。
+2. 在允许安全隔离代码的 Linux 主机上测 Code Pass@1；固定设备、精度、采样和题目后重跑数学与通用对照。
+3. 若目标仍是提高代码/数学正确率，再尝试带可验证奖励的 GRPO/RLVR；MoE 和多模态暂缓。
 
-这些内容属于后续实验，不作为当前最小闭环的前置依赖。
+目前的评测样本较少，数学分数没有显示稳定提升，代码通过率也尚未测出。因此项目展示重点应放在可复现的训练、权重加载和 API 闭环，不要宣称模型能力已经超过 MiniMind。
 
 ## 参考项目
 
