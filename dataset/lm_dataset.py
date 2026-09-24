@@ -192,6 +192,69 @@ class SFTDataset(Dataset):
         }
 
 
+class RLAIFDataset(Dataset):
+    """读取 MiniMind RLAIF 对话，只把待回答的上下文交给策略模型。"""
+
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer,
+        max_length: int = 768,
+        thinking_ratio: float = 0.5,
+    ) -> None:
+        super().__init__()
+        if max_length < 1:
+            raise ValueError("GRPO max_length 必须至少为 1")
+        if not 0.0 <= thinking_ratio <= 1.0:
+            raise ValueError("thinking_ratio 必须在 [0, 1] 范围内")
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.thinking_ratio = thinking_ratio
+        # 官方 RLAIF 文件可能带额外顶层字段；只读 conversations，避开 Arrow 对整行列名的强 schema cast。
+        self.samples = []
+        with open(data_path, "r", encoding="utf-8") as data_file:
+            for line_number, line in enumerate(data_file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"RLAIF JSONL 第 {line_number} 行不是有效 JSON") from exc
+                conversations = row.get("conversations") if isinstance(row, dict) else None
+                if not isinstance(conversations, list):
+                    raise ValueError(f"RLAIF JSONL 第 {line_number} 行缺少 conversations 列表")
+                self.samples.append(conversations)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        conversations = self.samples[index]
+        if not isinstance(conversations, list) or len(conversations) < 2:
+            raise ValueError(f"RLAIF 样本 {index} 至少需要一条上下文消息和一条末尾 assistant 消息")
+        if conversations[-1].get("role") != "assistant":
+            raise ValueError(f"RLAIF 样本 {index} 的最后一条消息必须是 assistant")
+
+        # 末尾 assistant 是数据集携带的参考回复；GRPO 只使用它前面的对话作为问题。
+        messages = [dict(message) for message in conversations[:-1]]
+        messages = _preprocess_chat(messages)
+        tools = None
+        for message in messages:
+            if message.get("role") == "system" and message.get("tools"):
+                tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+            if message.get("tool_calls") and isinstance(message["tool_calls"], str):
+                message["tool_calls"] = json.loads(message["tool_calls"])
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            open_thinking=random.random() < self.thinking_ratio,
+            tools=tools,
+        )
+        return {"prompt": prompt, "messages": messages}
+
+
 class DPODataset(Dataset):
     """读取 chosen/rejected 对话，只对最后一条 assistant 回复计算偏好。"""
 
