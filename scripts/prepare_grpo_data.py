@@ -18,21 +18,23 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _latest_user_prompt(messages: Any, *, require_assistant: bool) -> str:
+def _user_prompts(messages: Any, *, require_assistant: bool) -> list[str]:
     if not isinstance(messages, list) or not messages:
         raise ValueError("每条记录必须包含非空 conversations 列表")
+    if any(not isinstance(message, dict) for message in messages):
+        raise ValueError("conversations 中的每条消息都必须是对象")
     if require_assistant and messages[-1].get("role") != "assistant":
         raise ValueError("RLAIF 训练记录的最后一条消息必须是 assistant")
 
     context = messages[:-1] if messages[-1].get("role") == "assistant" else messages
-    user_messages = [
-        str(message.get("content", ""))
+    prompts = [
+        str(message.get("content") or "")
         for message in context
-        if isinstance(message, dict) and message.get("role") == "user"
+        if message.get("role") == "user" and str(message.get("content") or "").strip()
     ]
-    if not user_messages or not user_messages[-1].strip():
+    if not prompts:
         raise ValueError("记录中找不到非空的 user prompt")
-    return user_messages[-1]
+    return prompts
 
 
 def _prompt_key(prompt: str) -> str:
@@ -40,11 +42,16 @@ def _prompt_key(prompt: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def _heldout_prompt(row: dict[str, Any]) -> str:
+def _heldout_prompts(row: dict[str, Any]) -> list[str]:
+    if not isinstance(row, dict):
+        raise ValueError("held-out JSONL 每行必须是 JSON 对象")
     if isinstance(row.get("prompt"), str):
-        return row["prompt"]
+        prompt = row["prompt"]
+        if not prompt.strip():
+            raise ValueError("held-out prompt 不能为空")
+        return [prompt]
     if "conversations" in row:
-        return _latest_user_prompt(row["conversations"], require_assistant=False)
+        return _user_prompts(row["conversations"], require_assistant=False)
     raise ValueError("held-out JSONL 每行必须包含 prompt 字符串或 conversations 列表")
 
 
@@ -78,7 +85,7 @@ def prepare_grpo_data(
                 continue
             try:
                 row = json.loads(line)
-                heldout_keys.add(_prompt_key(_heldout_prompt(row)))
+                heldout_keys.update(_prompt_key(prompt) for prompt in _heldout_prompts(row))
             except (json.JSONDecodeError, ValueError) as exc:
                 raise ValueError(f"held-out JSONL 第 {line_number} 行无效：{exc}") from exc
     if not heldout_keys:
@@ -107,12 +114,12 @@ def prepare_grpo_data(
                     rows_scanned += 1
                     try:
                         row = json.loads(line)
-                        prompt = _latest_user_prompt(
+                        prompts = _user_prompts(
                             row.get("conversations"), require_assistant=True
                         )
                     except (json.JSONDecodeError, ValueError) as exc:
                         raise ValueError(f"RLAIF JSONL 第 {line_number} 行无效：{exc}") from exc
-                    if _prompt_key(prompt) in heldout_keys:
+                    if any(_prompt_key(prompt) in heldout_keys for prompt in prompts):
                         rows_removed += 1
                         continue
                     prepared.write(line if line.endswith("\n") else line + "\n")
@@ -123,7 +130,7 @@ def prepare_grpo_data(
         os.replace(temporary_output, output)
         temporary_output = None
         result = {
-            "decontamination": "exact normalized match of the final user message",
+            "decontamination": "exact normalized match of any non-empty user message in conversation context",
             "source_url": source_url,
             "source_revision": source_revision,
             "source_license": source_license,

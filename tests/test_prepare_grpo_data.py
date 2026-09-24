@@ -7,6 +7,55 @@ from scripts.prepare_grpo_data import prepare_grpo_data
 
 
 class PrepareGRPODataTest(unittest.TestCase):
+    def test_heldout_match_in_history_removes_sample_with_empty_final_user_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_path = root / "rlaif.jsonl"
+            heldout_path = root / "heldout.jsonl"
+            output_path = root / "train.jsonl"
+            manifest_path = root / "manifest.json"
+            raw_rows = [
+                {
+                    "conversations": [
+                        {"role": "user", "content": "A held-out math question."},
+                        {"role": "assistant", "content": "Previous reply."},
+                        {"role": "user", "content": "A different follow-up."},
+                        {"role": "assistant", "content": "Another reply."},
+                        {"role": "user", "content": "   "},
+                        {"role": "assistant", "content": ""},
+                    ]
+                },
+                {
+                    "conversations": [
+                        {"role": "user", "content": "A different question."},
+                        {"role": "assistant", "content": "Reference answer."},
+                    ]
+                },
+            ]
+            raw_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in raw_rows), encoding="utf-8"
+            )
+            heldout_path.write_text(
+                json.dumps({"prompt": "a HELD-OUT math question."}) + "\n",
+                encoding="utf-8",
+            )
+
+            result = prepare_grpo_data(
+                str(raw_path),
+                str(heldout_path),
+                str(output_path),
+                str(manifest_path),
+                source_url="https://example.invalid/rlaif",
+                source_revision="test-revision",
+                source_license="test-license",
+            )
+
+            kept_rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(result["rows_scanned"], 2)
+            self.assertEqual(result["rows_removed"], 1)
+            self.assertEqual(result["rows_kept"], 1)
+            self.assertEqual(kept_rows[0]["conversations"][0]["content"], "A different question.")
+
     def test_held_out_prompt_is_removed_without_modifying_raw_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
