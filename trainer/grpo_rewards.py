@@ -28,7 +28,9 @@ class MiniMindRewardModel:
     """包装 MiniMind 官方 InternLM reward model 的 get_score 接口。"""
 
     def __init__(self, model_path: str, device: torch.device, dtype: torch.dtype) -> None:
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True, use_fast=False
+        )
         self.model = AutoModel.from_pretrained(
             model_path,
             torch_dtype=dtype,
