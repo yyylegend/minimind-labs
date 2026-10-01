@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -227,16 +228,23 @@ def _load_model(checkpoint: Path, tokenizer, args, device, dtype):
     return model.to(device=device, dtype=dtype).eval()
 
 
+def _extract_input_ids(prompt_encoding: Any) -> Any:
+    if isinstance(prompt_encoding, Mapping):
+        return prompt_encoding["input_ids"]
+    return prompt_encoding
+
+
 def _generate(model, tokenizer, task: dict[str, Any], device, max_new_tokens: int) -> str:
     import torch
 
-    prompt_ids = tokenizer.apply_chat_template(
+    prompt_encoding = tokenizer.apply_chat_template(
         [{"role": "user", "content": task["eval_prompt"]}],
         tokenize=True,
         add_generation_prompt=True,
         return_tensors="pt",
         tools=None,
-    ).to(device)
+    )
+    prompt_ids = _extract_input_ids(prompt_encoding).to(device)
     generated = model.generate(
         prompt_ids,
         max_new_tokens=max_new_tokens,
